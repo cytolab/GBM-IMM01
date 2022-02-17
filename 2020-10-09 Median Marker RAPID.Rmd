@@ -1,0 +1,258 @@
+---
+title: "Data Analysis Workflow Using Median Marker RAPID Todd's Data"
+author: "Sierra Barone"
+date: "10/09/2020"
+output: pdf_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+## Median Marker Risk Assessment Population IDentification (RAPID) Workflow
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# uncomment lines below to install packages
+# install.packages("survminer", repos = "http://cran.us.r-project.org")
+# install.packages("Rtsne", repos = "http://cran.us.r-project.org")
+# install.packages("devtools", repos = "http://cran.us.r-project.org")
+# devtools::install_github("cytolab/mem")
+# install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+# BiocManager::install("flowCore")
+# BiocManager::install("FlowSOM")
+# BiocManager::install("Biobase")
+# install.packages("ggpubr", repos = "http://cran.us.r-project.org")
+# install.packages(paste(getwd(), sep=""), type = "source", repos=NULL)
+
+# load packages into the working library
+library(devtools)
+library(MEM)
+library(RAPID)
+library(tidyverse)
+library(ggpubr)
+library(flowCore)
+library(Biobase)
+library(FlowSOM)
+library(survival)
+library(survminer)
+library(plyr)
+library(Rtsne)
+
+# set working directory 
+setwd(paste(getwd(),"/data_files/19_dataset/", sep = ""))
+#setwd(paste(getwd(),"/data_files/12_dataset/", sep = ""))
+#setwd(paste(getwd(),"/data_files/10_dataset/", sep = ""))
+
+
+# set output file name tag 
+output_filename = "_RAPID"
+
+# read data into R
+
+# 19/25 patients immunophenotyping panel
+# 12/25 patients immune checkpoint panel
+# 10/25 patients phospho stim panel
+
+data.set <-  dir(pattern="*.fcs")
+data <- lapply(lapply(data.set,read.FCS),exprs)
+combined.patient.data = as.data.frame(do.call(rbind, mapply(cbind, data, "FILE_ID"= c(1:length(data)), SIMPLIFY=F)))
+orig.names <- colnames(combined.patient.data) 
+colnames(combined.patient.data) =c((read.FCS(data.set[[1]])@parameters@data[["desc"]]),"FILE_ID")
+
+# to see patient order, uncomment and run line below
+# data.set
+
+# create varible for survival or clinical data
+OS.data.set <-  dir(pattern="*.csv")
+OS.data = read.csv(OS.data.set)
+```
+
+```{r run t}
+# transform other data 
+transformed.data <- combined.patient.data %>%
+  select(-contains('FILE_ID')) %>%
+  mutate_all(function(x) asinh(x/5))
+
+# choose markers to use for variance calculation and transform
+
+#19/25
+chosen.markers <- transformed.data[c(10,12:15,19:22,24,29:30,33:35,39)]
+
+# 12/25
+# chosen.markers <- transformed.data[c(3,17:18,20:23,27,40,44,46,48,52,60)]
+
+# 10/25
+#chosen.markers <- transformed.data %>%
+#  select(contains('(v)')) 
+#tsne.data <- combined.patient.data %>%
+#  select(contains("tSNE"))
+
+set.seed(1)
+mytSNE = Rtsne(chosen.markers, dims = 2, initial_dims = length(chosen.markers), perplexity = 30, check_duplicates = FALSE, max_iter = 10000, verbose = TRUE)
+tsne.data = as.data.frame(mytSNE$Y)
+
+TSNE.and.ptIDS <- cbind(tsne.data,as.data.frame(combined.patient.data$`FILE_ID`))
+colnames(TSNE.and.ptIDS)[ncol(TSNE.and.ptIDS)] <- 'FILE_ID'
+
+# 19/25
+markers.to.keep = transformed.data[,c(9,11,16:18,23,25:28,31:32,36:38)]
+
+# 12/25
+# markers.to.keep = transformed.data[,c(19,24,25:26,29:32,34:39,41:43,45,47,49:51)]
+
+# 10/25
+#markers.to.keep <- transformed.data %>%
+#  select(contains('p-')) 
+```
+
+```{r FlowSOM Optimization of clusters}
+optimized.cluster.data = optimize_FlowSOM_clusters(tsne.data, chosen.markers, N = 50, seed = 38)
+
+# 10/25
+# optimized.cluster.data = combined.patient.data$cluster
+
+FlowSOM_clusters_plot <- plot_clusters(x = tsne.data[,1],y = tsne.data[,2], clusters = as.factor(optimized.cluster.data),xlab ="t-SNE 1",ylab = "t-SNE 2",legendtitle = "FlowSOM Cluster",title = "t-SNE with FlowSOM Clusters")
+FlowSOM_clusters_plot
+```
+
+```{r find clinically significant clusters}
+# create output files folder by uncommenting and running line below 
+dir.create(file.path(getwd(), "output files"), showWarnings = FALSE)
+
+# start median marker and iqr calculations per patient per cluster
+cluster_and_patient_df = as.data.frame(cbind(optimized.cluster.data,combined.patient.data$`FILE_ID`,markers.to.keep))
+cluster_and_patient_df[,1] <- as.factor(cluster_and_patient_df[,1])
+cluster_and_patient_df[,2] <- as.factor(cluster_and_patient_df[,2])
+patient.subsets <- split(cluster_and_patient_df,cluster_and_patient_df[,1])
+
+median.marker.expression <- list()
+all.median.marker.expressions <- list()
+for (x in 1:max(length(patient.subsets))){
+  bycluster = split(patient.subsets[[x]],patient.subsets[[x]][,2])
+  for (j in 1:length(bycluster)){
+  median.marker.expression[[j]] = apply(bycluster[[j]][,c(3:(ncol(markers.to.keep)+2))],2,FUN = median)
+  }
+  all.median.marker.expressions[[x]] = do.call(rbind, median.marker.expression)}
+
+IQR <- list()
+for (y in 1: length(all.median.marker.expressions)){
+  IQR[[y]] = apply(all.median.marker.expressions[[y]],2,FUN = IQR,na.rm = TRUE)}
+all.IQRs = do.call(rbind,IQR) 
+rownames(all.IQRs) <- c(names(patient.subsets))
+names(all.median.marker.expressions) <- c(names(patient.subsets))
+write.csv(all.IQRs,paste("./output files/",strftime(Sys.time(),"%Y-%m-%d_%H%M%S"),"_marker_IQR_cutoffs.csv"))
+
+split.groups <- list()
+cluster.groups <- list()
+for (e in 1:length(all.median.marker.expressions)){
+  for (z in 1:ncol(all.median.marker.expressions[[e]])){
+    all.median.marker.expressions[[e]][,z][is.na(all.median.marker.expressions[[e]][,z])] <- 0
+  split.groups[[z]] <-(all.median.marker.expressions[[e]][,z]>all.IQRs[[e,z]])
+    split.groups[[z]][split.groups[[z]]==TRUE] = 1}
+  cluster.groups[[e]]<-t(do.call(rbind,split.groups))}
+names(cluster.groups) <- c(names(patient.subsets))
+
+sink(paste("./output files/",strftime(Sys.time(),"%Y-%m-%d_%H%M%S"),"_median marker expression per marker per patient n each cluster.txt"))
+print(all.median.marker.expressions)
+sink()
+```
+
+```{r survival}
+
+# find clusters based on median marker expression that stratify outcome
+  survival_plot <- list()
+  all.survival <- list()
+  high.low.groups <- list()
+  low.median = list()
+  high.median = list()
+  survival.by.marker <- list()
+  Median_Low_Group <- list()
+  Median_High_Group <- list()
+  count = 1 
+  
+sink(paste("./output files/",strftime(Sys.time(),"%Y-%m-%d_%H%M%S"),"_median marker expression survival stats.txt"))
+  for (s in 1:length(cluster.groups)){
+    for(r in 1:ncol(cluster.groups[[s]])){
+      
+    Group <- factor(cluster.groups[[s]][,r], levels = c(0,1), labels = c("Low", "High"))
+    survival_data1 = cbind(OS.data,Group)
+    model1 <- survfit(Surv(OS.Time, OS.Status) ~ Group, data=survival_data1)
+    model2 <- coxph(Surv(OS.Time, OS.Status) ~ Group, data=survival_data1)
+    cox.summary = summary(model2)
+    survival_stat = cox.summary$coefficients
+    CI = cox.summary$conf.int
+    
+    high.low.groups = split(survival_data1,survival_data1$Group)
+    low.median[[r]] = median(high.low.groups[["Low"]][[2]])
+    high.median[[r]] = median(high.low.groups[["High"]][[2]])
+     
+    if (summary(Group)[1]<=3){
+    survival_stat[,5] <- 1}
+    if (summary(Group)[2]<=3){
+      survival_stat[,5] <- 1}
+    if (is.na(survival_stat[,5]) == TRUE){
+                  survival_stat[,5] <- 1}
+    print(paste("Subset #", names(cluster.groups)[s],":",colnames(all.IQRs)[r],"(p = ", round(survival_stat[,5],3), ", HR = ",round(survival_stat[,2],3),", CI[",round(CI[,3],3),",",round(CI[,4],3),"])", sep=""))
+    if (survival_stat[,5] <= 0.05){
+      survival_plot[[count]] <- ggsurvplot(model1, data=survival_data1, title = paste("Subset #", names(cluster.groups)[s],":",colnames(all.IQRs)[r], " (p = ", round(survival_stat[,5],3), ", HR = ",round(survival_stat[,2],3),", CI[",round(CI[,3],3),",",round(CI[,4],3),"])", sep=""),conf.int=F, pval=F, risk.table=T, tables.y.text = FALSE, legend.labs = c("Low", "High"), legend.title = "Group",fontsize = 4,tables.theme = theme_cleantable(base_size = 50),censor.shape=124)
+      print(survival_plot)
+      count = count+1
+    }}
+    high.medians = do.call(rbind,high.median)
+    rownames(high.medians)<- colnames(all.IQRs)
+    
+    low.medians = do.call(rbind,low.median)
+    rownames(low.medians)<- colnames(all.IQRs)
+    
+    Median_High_Group[[s]] = high.medians
+     Median_Low_Group[[s]] = low.medians
+  }
+  
+  names(Median_High_Group) <- c(names(patient.subsets))
+  names(Median_Low_Group) <- c(names(patient.subsets))
+sink()
+
+
+sink(paste("./output files/",strftime(Sys.time(),"%Y-%m-%d_%H%M%S"),"_median OS per cluster per marker (high group).txt"))
+print(Median_High_Group)
+sink()
+
+sink(paste("./output files/",strftime(Sys.time(),"%Y-%m-%d_%H%M%S"),"_median OS per cluster per marker (low group).txt"))
+print(Median_Low_Group)
+sink()
+
+```
+
+```{r create report}
+
+# export figures to PDF
+ggexport(FlowSOM_clusters_plot,survival_plot,filename = paste("./output files/",strftime(Sys.time(),"%Y-%m-%d_%H%M%S"),"_median marker RAPID results.pdf",sep=""), width = 7.2, height = 5.4)
+
+data.to.fcs = cbind(combined.patient.data,tsne.data,optimized.cluster.data)
+desc = colnames(data.to.fcs)[-c(ncol(combined.patient.data))]
+desc[(ncol(data.to.fcs)-3):(ncol(data.to.fcs)-1)]<- c("t-SNE1","t-SNE2","cluster")
+
+orig.names[(ncol(data.to.fcs)-2):ncol(data.to.fcs)]<- c("t-SNE1","t-SNE2","cluster")
+colnames(data.to.fcs)[1:ncol(data.to.fcs)]<-orig.names
+
+# export files
+separate.fcs.files = split(data.to.fcs,data.to.fcs$`FILE_ID`)
+for (i in 1:length(separate.fcs.files)){
+reduce.data = subset(separate.fcs.files[[i]], select=-c(`FILE_ID`))
+mat.input<- as.matrix(reduce.data)
+metadata <- data.frame(name = dimnames(mat.input)[[2]], desc = desc)
+metadata$range <- apply(apply(mat.input, 2, range), 2, diff)
+metadata$minRange <- apply(mat.input, 2, min)
+metadata$maxRange <- apply(mat.input, 2, max)
+input.flowframe <- new("flowFrame", exprs=mat.input,parameters = AnnotatedDataFrame(metadata))  
+newname  = str_remove(data.set[i], ".fcs")
+new.filename = paste0("./output files/",strftime(Sys.time(),"%Y-%m-%d_%H%M%S"),"_",newname,"_RAPID.fcs",sep="")
+write.FCS(input.flowframe,filename = new.filename)
+print(paste("FCS file ",i," done", sep = ""))}
+
+# print session information
+sessionInfo()
+```
+

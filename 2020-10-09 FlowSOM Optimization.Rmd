@@ -1,0 +1,104 @@
+---
+title: "FlowSOM Optimization"
+author: "Sierra Barone"
+date: "10/09/2020"
+output: pdf_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+## FlowSOM Optimization
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# uncomment lines below to install packages
+# install.packages("survminer", repos = "http://cran.us.r-project.org")
+# install.packages("Rtsne", repos = "http://cran.us.r-project.org")
+# install.packages("devtools", repos = "http://cran.us.r-project.org")
+# devtools::install_github("cytolab/mem")
+# install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+# BiocManager::install("flowCore")
+# BiocManager::install("FlowSOM")
+# BiocManager::install("Biobase")
+# install.packages("ggpubr", repos = "http://cran.us.r-project.org")
+# install.packages(paste(getwd(), sep=""), type = "source", repos=NULL)
+
+# load packages into the working library
+library(devtools)
+library(MEM)
+library(RAPID)
+library(tidyverse)
+library(ggpubr)
+library(flowCore)
+library(Biobase)
+library(FlowSOM)
+library(survival)
+library(survminer)
+library(plyr)
+library(Rtsne)
+
+# set working directory 
+setwd(paste(getwd(),"/data_files/10_dataset/", sep = ""))
+data.set <-  dir(pattern="*.fcs")
+data <- lapply(lapply(data.set,read.FCS),exprs)
+ID <- c(1:length(data)) 
+combined.patient.data = as.data.frame(do.call(rbind, mapply(cbind, data, "FILE_ID"= ID, SIMPLIFY=F)))
+orig.names = colnames(combined.patient.data)
+combined.patient.data$`FILE_ID` <- as.numeric(combined.patient.data$`FILE_ID`)
+colnames(combined.patient.data)[1:length(combined.patient.data)-1]<-as.character(read.FCS(data.set[[1]])@parameters@data[["desc"]])
+
+patientID = combined.patient.data$`FILE_ID` 
+
+# to see patient order, uncomment and run line below
+# data.set
+
+scaled.markers <- combined.patient.data %>%
+  select(contains('_')) %>%
+  select(-contains('FILE_ID')) %>%
+  mutate_all(function(x) asinh(x/5))
+
+tsne.markers <- scaled.markers %>%
+  select(contains("(v)"))
+
+tsne.data <- combined.patient.data %>%
+  select(contains("tSNE"))
+
+```
+
+```{r FlowSOM Optimization of clusters}
+optimized.cluster.data = optimize_FlowSOM_clusters(tsne.data, tsne.markers, N = 50, seed = 38)
+
+FlowSOM_clusters_plot <- plot_clusters(x = tsne.data[,1],y = tsne.data[,2], clusters = optimized.cluster.data,xlab ="t-SNE 1",ylab = "t-SNE 2",legendtitle = "FlowSOM Cluster",title = "t-SNE with FlowSOM Clusters")
+FlowSOM_clusters_plot
+```
+
+```{r write FCS files}
+# create output files folder by uncommenting and running line below 
+dir.create(file.path(getwd(), "output files"), showWarnings = FALSE)
+
+### output FlowSOM clusters as channel per patient/condition file
+data.to.fcs = cbind(combined.patient.data,optimized.cluster.data)
+desc = colnames(data.to.fcs)[-c(ncol(combined.patient.data))]
+desc[(ncol(data.to.fcs)-1)]<- c("cluster")
+
+orig.names[ncol(data.to.fcs)]<- c("cluster")
+colnames(data.to.fcs)[1:ncol(data.to.fcs)]<-orig.names
+
+# export 
+separate.fcs.files = split(data.to.fcs,data.to.fcs$`FILE_ID`)
+for (i in 1:length(separate.fcs.files)){
+reduce.data = subset(separate.fcs.files[[i]], select=-c(`FILE_ID`))
+mat.input<- as.matrix(reduce.data)
+metadata <- data.frame(name = dimnames(mat.input)[[2]], desc = desc)
+metadata$range <- apply(apply(mat.input, 2, range), 2, diff)
+metadata$minRange <- apply(mat.input, 2, min)
+metadata$maxRange <- apply(mat.input, 2, max)
+input.flowframe <- new("flowFrame", exprs=mat.input,parameters = AnnotatedDataFrame(metadata))  
+newname  = str_remove(data.set[i], ".fcs")
+new.filename = paste0("./output files/",strftime(Sys.time(),"%Y-%m-%d_%H%M%S"),"_",newname,"_FlowSOM.fcs",sep="")
+write.FCS(input.flowframe,filename = new.filename)
+print(paste("FCS file ",i," done", sep = ""))}
+```

@@ -1,0 +1,140 @@
+---
+title: "FlowSOM Optimization Iterations Per Patients"
+author: "Sierra Barone"
+date: "10/09/2020"
+output: pdf_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+## FlowSOM Optimization Iterations Per Patients
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# load packages into the working library
+library(devtools)
+library(RAPID)
+library(tidyverse)
+library(ggpubr)
+library(flowCore)
+library(Biobase)
+library(FlowSOM)
+library(plyr)
+library(matrixStats)
+
+# set working directory 
+setwd(paste(getwd(),"/data_files/19_dataset/", sep = ""))
+data.set <-  dir(pattern="*.fcs")
+
+for (s in 1:length(data.set)){
+data <- lapply(lapply(data.set[s],read.FCS),exprs)
+ID <- c(1:length(data)) 
+combined.patient.data = as.data.frame(do.call(rbind, mapply(cbind, data, "FILE_ID"= ID, SIMPLIFY=F)))
+orig.names = colnames(combined.patient.data)
+combined.patient.data$`FILE_ID` <- as.numeric(combined.patient.data$`FILE_ID`)
+colnames(combined.patient.data)[1:length(combined.patient.data)-1]<-as.character(read.FCS(data.set[[1]])@parameters@data[["desc"]])
+
+patientID = combined.patient.data$`FILE_ID` 
+
+# to see patient order, uncomment and run line below
+# data.set
+
+scaled.markers <- combined.patient.data %>%
+  select(contains('_')) %>%
+  select(-contains('FILE_ID')) %>%
+  mutate_all(function(x) asinh(x/5))
+
+tsne.markers <- scaled.markers %>%
+  select(contains("(v)"))
+
+tsne.data <- combined.patient.data %>%
+  select(contains("tSNE"))
+
+  # create flowFrame from input data
+  mat.input <- as.matrix(tsne.data)
+  metadata <- data.frame(name = dimnames(mat.input)[[2]], desc = dimnames(mat.input)[[2]])
+  metadata$range <- apply(apply(mat.input, 2, range), 2, diff)
+  metadata$minRange <- apply(mat.input, 2, min)
+  metadata$maxRange <- apply(mat.input, 2, max)
+  input.flowframe <- new("flowFrame", exprs=mat.input,parameters = AnnotatedDataFrame(metadata))
+  # create empty data frames for the for loop to store values
+  flowSOM.clusters <- list()
+  data.with.clusters <- list()
+  subset.data <- list()
+  subset.IQR.markers <- list()
+  mean.subset.IQR.markers <- list()
+  
+  # create output files folder by uncommenting and running line below 
+dir.create(file.path(getwd(), "output files"), showWarnings = FALSE)
+
+  N = 50
+  TEST.CLUSTER.NUM = N-4
+  # for loop to implement FlowSOM on each tSNE data set
+  for  (k in 1:TEST.CLUSTER.NUM) {
+    CLUSTER.NUMBER = k+4
+
+    # implement the FlowSOM function on the data
+    fSOM <- FlowSOM(input.flowframe, scale = TRUE, colsToUse = c(1:length(tsne.data)), nClus    = CLUSTER.NUMBER, seed = 38)
+
+    # create a cluster matrix
+    flowSOM.clusters[[k]] <- as.matrix(fSOM[[2]][fSOM[[1]]$map$mapping[,1]])
+    data.with.clusters[[k]] = cbind(tsne.markers, flowSOM.clusters[[k]])
+    colnames(data.with.clusters[[k]])[colnames(data.with.clusters[[k]]) ==  'flowSOM.clusters[[k]]'] <- 'cluster'
+    subset.data[[k]] <- split(data.with.clusters[[k]], data.with.clusters[[k]]$cluster)
+    FlowSOM.subset.data = subset.data[[k]]
+
+    # finding average IQR for each marker in each subset
+    for (l in 1:length(FlowSOM.subset.data)){
+      subset.matrix = as.matrix(FlowSOM.subset.data[[l]][-c(length(FlowSOM.subset.data[[l]]))])
+      subset.IQR.markers[[l]] = colIQRs(subset.matrix)}
+    mean.subset.IQR.markers[[k]] = rowMeans(as.data.frame(subset.IQR.markers))
+  }
+
+  # minimization of sums of average IQR for each marker
+  df = as.data.frame(t(data.frame(mean.subset.IQR.markers)))
+  colnames(df)<-colnames(tsne.markers)
+  rownames(df)<-c(5:CLUSTER.NUMBER)
+  write.csv(df,paste0("./output files/",strftime(Sys.time(),"%Y-%m-%d_%H%M%S"),"_averageIQR_FlowSOMclusters_file",s,".csv",sep = ""))
+  chosen.index <- list()
+
+  # find the optimal or ideal number of subsets, or FlowSOM clusters
+  for (m in 1:ncol(df)){
+    chosen.index[[m]] = which.min((df[,c(m)]))}
+
+  chosen.indexes = do.call(rbind, chosen.index)
+  IDEAL.INDEX = round(median(chosen.indexes))
+  IDEAL.NUM.SUBSETS = IDEAL.INDEX + 4
+  print(paste("Ideal number of FlowSOM clusters was calculated to be ", IDEAL.NUM.SUBSETS, sep = ""))
+  data.with.clusters[[IDEAL.INDEX]]$cluster = as.numeric(as.vector(data.with.clusters[[IDEAL.INDEX]]$cluster))
+
+FlowSOM_clusters_plot <- plot_clusters(x = tsne.data[,1],y = tsne.data[,2], clusters = data.with.clusters[[IDEAL.INDEX]]$cluster,xlab ="t-SNE 1",ylab = "t-SNE 2",legendtitle = "FlowSOM Cluster",title = "t-SNE with FlowSOM Clusters")
+FlowSOM_clusters_plot
+
+ggexport(FlowSOM_clusters_plot,filename = paste("./output files/",strftime(Sys.time(),"%Y-%m-%d_%H%M%S"),"_FlowSOMoptimization_file",s,".pdf",sep=""), width = 7.2, height = 5.4)
+
+
+### output FlowSOM clusters as channel per patient/condition file
+data.to.fcs = cbind(combined.patient.data,data.with.clusters[[IDEAL.INDEX]]$cluster)
+desc = colnames(data.to.fcs)[-c(ncol(combined.patient.data))]
+desc[(ncol(data.to.fcs)-1)]<- c("cluster")
+
+orig.names[ncol(data.to.fcs)]<- c("cluster")
+colnames(data.to.fcs)[1:ncol(data.to.fcs)]<-orig.names
+
+# export 
+separate.fcs.files = split(data.to.fcs,data.to.fcs$`FILE_ID`)
+for (i in 1:length(separate.fcs.files)){
+reduce.data = subset(separate.fcs.files[[i]], select=-c(`FILE_ID`))
+mat.input<- as.matrix(reduce.data)
+metadata <- data.frame(name = dimnames(mat.input)[[2]], desc = desc)
+metadata$range <- apply(apply(mat.input, 2, range), 2, diff)
+metadata$minRange <- apply(mat.input, 2, min)
+metadata$maxRange <- apply(mat.input, 2, max)
+input.flowframe <- new("flowFrame", exprs=mat.input,parameters = AnnotatedDataFrame(metadata))  
+newname  = str_remove(data.set[s], ".fcs")
+new.filename = paste0("./output files/",strftime(Sys.time(),"%Y-%m-%d_%H%M%S"),"_",newname,"_FlowSOM_file",s,".fcs",sep="")
+write.FCS(input.flowframe,filename = new.filename)
+print(paste("FCS file ",s," done", sep = ""))}
+}
+```

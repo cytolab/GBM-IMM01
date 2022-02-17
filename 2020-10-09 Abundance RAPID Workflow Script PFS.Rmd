@@ -1,0 +1,165 @@
+---
+title: "Data Analysis Workflow Using Abundance RAPID Todd's Data"
+author: "Sierra Barone"
+date: "10/09/2020"
+output: pdf_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+## Abundance Risk Assessment Population IDentification (RAPID) Workflow
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# uncomment lines below to install packages
+# install.packages("survminer", repos = "http://cran.us.r-project.org")
+# install.packages("Rtsne", repos = "http://cran.us.r-project.org")
+# install.packages("devtools", repos = "http://cran.us.r-project.org")
+# devtools::install_github("cytolab/mem")
+# install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+# BiocManager::install("flowCore")
+# BiocManager::install("FlowSOM")
+# BiocManager::install("Biobase")
+# install.packages("ggpubr", repos = "http://cran.us.r-project.org")
+# install.packages(paste(getwd(), sep=""), type = "source", repos=NULL)
+
+# load packages into the working library
+library(devtools)
+library(MEM)
+library(RAPID)
+library(tidyverse)
+library(ggpubr)
+library(flowCore)
+library(Biobase)
+library(FlowSOM)
+library(survival)
+library(survminer)
+library(plyr)
+library(Rtsne)
+
+# set working directory 
+#setwd(paste(getwd(),"/data_files/19_dataset/", sep = ""))
+setwd(paste(getwd(),"/data_files/pfs_12_abundance/", sep = ""))
+#setwd(paste(getwd(),"/data_files/12_dataset/", sep = ""))
+
+
+# set output file name tag 
+output_filename = "_RAPID"
+
+# read data into R
+
+# 19/25 patients immunophenotyping panel
+# 12/25 patients immune checkpoint panel
+
+data.set <-  dir(pattern="*.fcs")
+data <- lapply(lapply(data.set,read.FCS),exprs)
+combined.patient.data = as.data.frame(do.call(rbind, mapply(cbind, data,  SIMPLIFY=F)))
+orig.names <- colnames(combined.patient.data) 
+colnames(combined.patient.data) =c((read.FCS(data.set[[1]])@parameters@data[["desc"]]))
+
+# to see patient order, uncomment and run line below
+# data.set
+
+# create varible for survival or clinical data
+OS.data.set <-  dir(pattern="*.csv")
+OS.data = read.csv(OS.data.set)
+``` 
+
+```{r data and constants}
+# selecting t-SNE columns from data set
+tsne.data <- combined.patient.data %>%
+  select(contains('tSNE'))
+
+# transform other data 
+transformed.data <- combined.patient.data %>%
+  select(-contains('FILE_ID')) %>%
+  mutate_all(function(x) asinh(x/5))
+
+# choose markers to use for variance calculation and transform
+chosen.markers <- transformed.data %>%
+  select(contains('(v)'))
+```
+
+```{r FlowSOM Optimization of clusters}
+# find ideal numbers of clusters and create cluster ID data
+optimized.cluster.data = combined.patient.data$Cluster
+
+# plot optimized FlowSOM clusters
+FlowSOM_clusters_plot <- plot_clusters(x = tsne.data[,2],y = tsne.data[,1], clusters = as.factor(optimized.cluster.data),xlab ="t-SNE 2",ylab = "t-SNE 1",legendtitle = "FlowSOM Cluster",title = "t-SNE with FlowSOM Clusters")
+FlowSOM_clusters_plot
+```
+
+```{r find clinically significant clusters}
+# cluster ID in 1st column and patient ID in 2nd column
+cluster.patient.data = as.data.frame(cbind(optimized.cluster.data,combined.patient.data$`FILE ID`))
+
+# calculate survival statistics
+survival_stats <- subset_survival_analysis(cluster.patient.data, OS.data, clinical_col = 4, status_col = 5)
+
+# plot significant survival curves
+survival_plots <- plot_survival_curves(survival_stats, cluster.patient.data, OS.data, clinical_col = 4, status_col = 5)
+survival_plots
+
+# find significant subsets and assign prognostic value (1 = none, 2 = positive prog., 3 = negative prog.)
+prognostic_subsets = significant_clusters(survival_stats, cluster_data = optimized.cluster.data)
+
+# plot significant subsets
+RAPID_plot <- plot_sig_clusters(x = tsne.data[,2], y = tsne.data[,1], clusters = optimized.cluster.data, survival_stats,xlab ="t-SNE 2",ylab = "t-SNE 1",legendtitle = "Prognostic Subsets",title = "t-SNE with Prognostic Populations")
+RAPID_plot
+```
+
+```{r MEM}
+cluster = optimized.cluster.data
+MEM.data = cbind(transformed.data,cluster)
+
+# use MEM to find marker enrichments for FlowSOM clusters
+
+# identity proteins and signaling proteins
+
+#19/25
+MEM.values.p = MEM(MEM.data, transform = FALSE, cofactor = 0, choose.markers = FALSE, markers = "9:39",choose.ref = FALSE, zero.ref = FALSE, rename.markers = FALSE, new.marker.names = "ICOS,CD19,TIM3,CD11b,CD4,CD64,CD20,CD38,CCR4,CD43,CD14,TCRgd,CD45RA,CD45,CXCR3,CD33,CD28,CD32,CD69,HLA-DR,CD45R0,CD16,CD44,CD27,CD8,CD3,CXCR5,CD57,PD-1,PD-L1,CD56",file.is.clust = FALSE, add.fileID = FALSE, IQR.thresh = NULL)
+
+# 12/25
+# MEM.values.p = MEM(MEM.data, transform = FALSE, cofactor = 0, choose.markers = FALSE, markers = "3,17:27,29:32,34:52,60",choose.ref = FALSE, zero.ref = FALSE, rename.markers = FALSE, new.marker.names = "CD45,CD209,CD19,CD127,CD11b,CD4,CD64,CD20,CD38,CCR4,LAG3,CD14,TIGIT,PD-L2,RGMb,CXCR3,4-1BB,CCR7,VISTA,CD32,CD69,HLA-DR,CD45RO,CD40,CD44,CD27,CD8,CD25,CD3,GzmB,CX3CR1,B7-H3,PD-1,PD-L1,CD56,CD16",file.is.clust = FALSE, add.fileID = FALSE, IQR.thresh = NULL)
+
+# build MEM heatmap and output enrichment scores
+build.heatmaps(MEM.values.p, cluster.MEM = "both", cluster.medians = "none", 
+display.thresh = 1, newWindow.heatmaps=FALSE, output.files = TRUE, labels = FALSE, only.MEMheatmap = FALSE)
+
+```
+
+```{r create report}
+# create output files folder by uncommenting and running line below 
+dir.create(file.path(getwd(), "output files"), showWarnings = FALSE)
+
+# export figures to PDF
+ggexport(RAPID_plot,survival_plots,filename = paste("./output files/",strftime(Sys.time(),"%Y-%m-%d_%H%M%S"),output_filename,".pdf",sep=""), width = 7.2, height = 5.4)
+
+data.to.fcs = cbind(combined.patient.data,prognostic_subsets)
+desc = colnames(data.to.fcs)[-c(ncol(combined.patient.data))]
+desc[(ncol(data.to.fcs)-2):(ncol(data.to.fcs)-1)]<- c("Cluster","Prog_Status")
+
+orig.names[(ncol(data.to.fcs)-1):ncol(data.to.fcs)]<- c("Cluster","Prog_Status")
+colnames(data.to.fcs)[1:ncol(data.to.fcs)]<-orig.names
+
+# export 
+separate.fcs.files = split(data.to.fcs,data.to.fcs$`FILE_ID`)
+for (i in 1:length(separate.fcs.files)){
+reduce.data = subset(separate.fcs.files[[i]], select=-c(`FILE_ID`))
+mat.input<- as.matrix(reduce.data)
+metadata <- data.frame(name = dimnames(mat.input)[[2]], desc = desc)
+metadata$range <- apply(apply(mat.input, 2, range), 2, diff)
+metadata$minRange <- apply(mat.input, 2, min)
+metadata$maxRange <- apply(mat.input, 2, max)
+input.flowframe <- new("flowFrame", exprs=mat.input,parameters = AnnotatedDataFrame(metadata))  
+newname  = str_remove(data.set[i], ".fcs")
+new.filename = paste0("./output files/",strftime(Sys.time(),"%Y-%m-%d_%H%M%S"),"_",newname,"_RAPID.fcs",sep="")
+write.FCS(input.flowframe,filename = new.filename)
+print(paste("FCS file ",i," done", sep = ""))}
+
+# print session information
+sessionInfo()
+```
